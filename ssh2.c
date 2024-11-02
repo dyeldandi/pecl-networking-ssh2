@@ -293,13 +293,14 @@ static int php_ssh2_set_method(LIBSSH2_SESSION *session, HashTable *ht, char *me
 }
 /* }}} */
 
+
 /* {{{ php_ssh2_session_connect
  * Connect to an SSH server with requested methods
  */
-LIBSSH2_SESSION *php_ssh2_session_connect(char *host, int port, zval *methods, zval *callbacks)
+LIBSSH2_SESSION *php_ssh2_session_connect(char *host, int port, zval *methods, zval *callbacks, php_stream *stream, void *sendCB, void *recvCB, int oldSocket)
 {
 	LIBSSH2_SESSION *session;
-	int socket;
+	int socket = -1;
 	php_ssh2_session_data *data;
 	struct timeval tv;
 	zend_string *hash_lookup_zstring;
@@ -307,21 +308,29 @@ LIBSSH2_SESSION *php_ssh2_session_connect(char *host, int port, zval *methods, z
 	tv.tv_sec = FG(default_socket_timeout);
 	tv.tv_usec = 0;
 
-	socket = php_network_connect_socket_to_host(host, port, SOCK_STREAM, 0, &tv, NULL, NULL, NULL, 0, STREAM_SOCKOP_NONE);
+	if (stream == NULL) {
+		socket = php_network_connect_socket_to_host(host, port, SOCK_STREAM, 0, &tv, NULL, NULL, NULL, 0, STREAM_SOCKOP_NONE);
 
-	if (socket <= 0) {
-		php_error_docref(NULL, E_WARNING, "Unable to connect to %s on port %d", host, port);
-		return NULL;
+		if (socket <= 0) {
+			php_error_docref(NULL, E_WARNING, "Unable to connect to %s on port %d", host, port);
+			return NULL;
+		}
+	} else {
+		socket = oldSocket;
 	}
 
 	data = ecalloc(1, sizeof(php_ssh2_session_data));
+
 	data->socket = socket;
+	data->stream = stream;
 
 	session = libssh2_session_init_ex(php_ssh2_alloc_cb, php_ssh2_free_cb, php_ssh2_realloc_cb, data);
 	if (!session) {
 		php_error_docref(NULL, E_WARNING, "Unable to initialize SSH2 session");
 		efree(data);
-		closesocket(socket);
+		if (socket > 0) {
+			closesocket(socket);
+		}
 		return NULL;
 	}
 	libssh2_banner_set(session, LIBSSH2_SSH_DEFAULT_BANNER " PHP");
@@ -394,6 +403,11 @@ LIBSSH2_SESSION *php_ssh2_session_connect(char *host, int port, zval *methods, z
 		}
 	}
 
+	if (stream != NULL && sendCB != NULL && recvCB != NULL) {
+		libssh2_session_callback_set(session, LIBSSH2_CALLBACK_SEND, sendCB);
+		libssh2_session_callback_set(session, LIBSSH2_CALLBACK_RECV, recvCB);
+	}
+
 	if (libssh2_session_startup(session, socket)) {
 		int last_error = 0;
 		char *error_msg = NULL;
@@ -407,6 +421,40 @@ LIBSSH2_SESSION *php_ssh2_session_connect(char *host, int port, zval *methods, z
 	}
 
 	return session;
+}
+/* }}} */
+
+/* {{{ tunnel_sendcb
+ * Callback to tunnel a new ssh session through ssh tunnel
+ */
+ssize_t tunnel_sendcb(libssh2_socket_t sockfd, const void *buffer, size_t length, int flags, void **abstract)
+{
+	ssize_t ret;
+	php_ssh2_session_data *data = (php_ssh2_session_data*)(*abstract);
+	php_stream *stream = data->stream;
+
+	ret = php_stream_write(stream, buffer, length);
+	if (ret < 0) {
+		return -EAGAIN;
+	}
+	return ret;
+}
+/* }}} */
+
+/* {{{ tunnel_recvcb
+ * Callback to tunnel a new ssh session through ssh tunnel
+ */
+ssize_t tunnel_recvcb(libssh2_socket_t sockfd, void *buffer, size_t length, int flags, void **abstract)
+{
+	ssize_t ret;
+	php_ssh2_session_data *data = (php_ssh2_session_data*)(*abstract);
+	php_stream *stream = data->stream;
+
+	ret = php_stream_read(stream, buffer, length);
+	if (ret < 0) {
+		return -EAGAIN;
+	}
+	return ret;
 }
 /* }}} */
 
@@ -425,7 +473,7 @@ PHP_FUNCTION(ssh2_connect)
 		return;
 	}
 
-	session = php_ssh2_session_connect(host, port, methods, callbacks);
+	session = php_ssh2_session_connect(host, port, methods, callbacks, NULL, NULL, NULL, -1);
 	if (!session) {
 		php_error_docref(NULL, E_WARNING, "Unable to connect to %s", host);
 		RETURN_FALSE;
@@ -434,6 +482,42 @@ PHP_FUNCTION(ssh2_connect)
 	RETURN_RES(zend_register_resource(session, le_ssh2_session));
 }
 /* }}} */
+
+/* {{{ proto resource ssh2_connect(resource socket[, array methods[, array callbacks]])
+ * Establish a connection using already connected socket and return a resource on success, false on error
+ */
+PHP_FUNCTION(ssh2_connect_tunnel)
+{
+	LIBSSH2_SESSION *session;
+	zval *methods = NULL, *callbacks = NULL;
+	zval *zsocket;
+	php_stream *stream;
+	int socket;
+	int ret;
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "ra!a!", &zsocket, &methods, &callbacks) == FAILURE) {
+		return;
+	}
+
+	php_stream_from_zval(stream, zsocket);
+
+	ret = php_stream_cast(stream, PHP_STREAM_AS_FD, (void**)&socket, PHP_STREAM_CAST_TRY_HARD);
+	if (ret != SUCCESS) {
+		php_error_docref(NULL, E_WARNING, "Unable to convert socket to fd");
+		RETURN_FALSE;
+	}
+
+	session = php_ssh2_session_connect(NULL, 0, methods, callbacks, stream, tunnel_sendcb, tunnel_recvcb, socket);
+	if (!session) {
+		php_error_docref(NULL, E_WARNING, "Unable to connect using given tunnel stream");
+		RETURN_FALSE;
+	}
+
+	RETURN_RES(zend_register_resource(session, le_ssh2_session));
+}
+/* }}} */
+
+
 
 /* {{{ proto resource ssh2_disconnect(resource session)
  * close a connection to a remote SSH server and return a true on success, false on error.
@@ -1397,6 +1481,12 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ssh2_connect, 0, 0, 1)
  	ZEND_ARG_INFO(0, callbacks)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ssh2_connect_tunnel, 0, 0, 1)
+ 	ZEND_ARG_INFO(0, socket)
+ 	ZEND_ARG_INFO(0, methods)
+ 	ZEND_ARG_INFO(0, callbacks)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO(arginfo_ssh2_disconnect, 1)
  	ZEND_ARG_INFO(0, session)
 ZEND_END_ARG_INFO()
@@ -1609,6 +1699,7 @@ ZEND_END_ARG_INFO()
  */
 zend_function_entry ssh2_functions[] = {
 	PHP_FE(ssh2_connect,						arginfo_ssh2_connect)
+	PHP_FE(ssh2_connect_tunnel,						arginfo_ssh2_connect_tunnel)
 	PHP_FE(ssh2_disconnect,						arginfo_ssh2_disconnect)
 	PHP_FE(ssh2_methods_negotiated,				arginfo_ssh2_methods_negotiated)
 	PHP_FE(ssh2_fingerprint,					arginfo_ssh2_fingerprint)
