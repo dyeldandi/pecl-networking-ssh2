@@ -500,7 +500,6 @@ PHP_FUNCTION(ssh2_connect_tunnel)
 	}
 
 	php_stream_from_zval(stream, zsocket);
-
 	ret = php_stream_cast(stream, PHP_STREAM_AS_FD, (void**)&socket, PHP_STREAM_CAST_TRY_HARD);
 	if (ret != SUCCESS) {
 		php_error_docref(NULL, E_WARNING, "Unable to convert socket to fd");
@@ -512,6 +511,8 @@ PHP_FUNCTION(ssh2_connect_tunnel)
 		php_error_docref(NULL, E_WARNING, "Unable to connect using given tunnel stream");
 		RETURN_FALSE;
 	}
+
+	Z_ADDREF_P(zsocket);
 
 	RETURN_RES(zend_register_resource(session, le_ssh2_session));
 }
